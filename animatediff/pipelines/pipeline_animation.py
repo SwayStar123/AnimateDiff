@@ -463,3 +463,202 @@ class AnimationPipeline(DiffusionPipeline):
             return video
 
         return AnimationPipelineOutput(videos=video)
+    
+    @torch.no_grad()
+    def inpaint(
+        self,
+        prompt: Union[str, List[str]],
+        denoise_mask: List[int],
+        inpaint_context: torch.FloatTensor,
+        video_length: Optional[int],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_videos_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "tensor",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: Optional[int] = 1,
+
+        # support controlnet
+        controlnet_images: torch.FloatTensor = None,
+        controlnet_image_index: list = [0],
+        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+
+        **kwargs,
+    ):
+        # Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # Check inputs. Raise error if not correct
+        self.check_inputs(prompt, height, width, callback_steps)
+
+        # Define call parameters
+        # batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        batch_size = 1
+        if latents is not None:
+            batch_size = latents.shape[0]
+        if isinstance(prompt, list):
+            batch_size = len(prompt)
+
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # Encode input prompt
+        prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
+        if negative_prompt is not None:
+            negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size 
+        text_embeddings = self._encode_prompt(
+            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
+        )
+
+        # Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # Prepare latent variables
+        num_channels_latents = self.unet.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_videos_per_prompt,
+            num_channels_latents,
+            video_length,
+            height,
+            width,
+            text_embeddings.dtype,
+            device,
+            generator,
+            latents,
+        )
+        latents_dtype = latents.dtype
+
+        # Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                print("TIMESTEP: ", t)
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                down_block_additional_residuals = mid_block_additional_residual = None
+                if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
+                    assert controlnet_images.dim() == 5
+
+                    controlnet_noisy_latents = latent_model_input
+                    controlnet_prompt_embeds = text_embeddings
+
+                    controlnet_images = controlnet_images.to(latents.device)
+
+                    controlnet_cond_shape    = list(controlnet_images.shape)
+                    controlnet_cond_shape[2] = video_length
+                    controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+
+                    controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                    controlnet_conditioning_mask_shape[1] = 1
+                    controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+
+                    assert controlnet_images.shape[2] >= len(controlnet_image_index)
+                    controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
+                    controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
+
+                    down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
+                        controlnet_noisy_latents, t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=controlnet_cond,
+                        conditioning_mask=controlnet_conditioning_mask,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        guess_mode=False, return_dict=False,
+                    )
+
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input, t, 
+                    encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals = down_block_additional_residuals,
+                    mid_block_additional_residual   = mid_block_additional_residual,
+                ).sample.to(dtype=latents_dtype)
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                
+                context_latents = self.vae.encode(inpaint_context.to(self.device)).latent_dist.sample()
+                noised_latents = noised_at_timestep(context_latents, t, self.device).permute(1, 0, 2, 3)
+                print("Latents shape: ", latents.shape)
+                latents[0] = replace_one_hot_encoded(denoise_mask, noised_latents, latents[0])
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        callback(i, t, latents)
+
+        # Post-processing
+        video = self.decode_latents(latents)
+
+        # Convert to tensor
+        if output_type == "tensor":
+            video = torch.from_numpy(video)
+
+        if not return_dict:
+            return video
+
+        return AnimationPipelineOutput(videos=video)
+    
+from omegaconf import OmegaConf
+
+# noise_scheduler_kwargs:
+#   num_train_timesteps: 1000
+#   beta_start:          0.00085
+#   beta_end:            0.012
+#   beta_schedule:       "linear"
+#   steps_offset:        1
+#   clip_sample:         false
+def get_noise_scheduler_kwargs():
+    return OmegaConf.create({
+        "num_train_timesteps": 1000,
+        "beta_start":          0.00085,
+        "beta_end":            0.012,
+        "beta_schedule":       "linear",
+        "steps_offset":        1,
+        "clip_sample":         False
+    })
+
+def noised_at_timestep(latents, timestep, device):
+    noise = torch.randn_like(latents).to(device)
+    noise_scheduler = DDIMScheduler(**OmegaConf.to_container(get_noise_scheduler_kwargs()))
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timestep)
+    return noisy_latents
+
+# Gets a list of noised latents, and a list of denoised latents, replaces the denoised latents with the noised latents for 
+# every index with a value of 1 in one_hot_encoded
+def replace_one_hot_encoded(one_hot_encoded, noised_latents, denoised_latents):
+    noised_latents = noised_latents.permute(1, 0, 2, 3)
+    denoised_latents = denoised_latents.permute(1, 0, 2, 3)
+    print("Noised latents shape: ", noised_latents.shape)
+    print("one_hot_encoded: ", len(one_hot_encoded))
+    print("noised_latents: ", len(noised_latents))
+    print("denoised_latents: ", len(denoised_latents))
+    assert len(one_hot_encoded) == len(noised_latents) == len(denoised_latents)
+    for i in range(len(one_hot_encoded)):
+        if one_hot_encoded[i] == 1:
+            denoised_latents[i] = noised_latents[i]
+
+    denoised_latents = denoised_latents.permute(1, 0, 2, 3)
+    return denoised_latents
+

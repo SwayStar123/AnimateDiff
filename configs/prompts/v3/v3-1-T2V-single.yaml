@@ -1,0 +1,19 @@
+# 2-interpolation
+- domain_lora_scale: 1.0
+  adapter_lora_path: "models/Motion_Module/v3_sd15_adapter.ckpt"
+  dreambooth_path:   ""
+
+  inference_config: "configs/inference/inference-v3.yaml"
+  motion_module:    "models/Motion_Module/v3_sd15_mm.ckpt"
+
+  H: 256
+  W: 384
+  seed: [1234,2345]
+  steps: 25
+  guidance_scale: 8.5
+
+  prompt:
+    - "a beautiful blue butterfly flying around flowers, closeup, 4k UHD"
+    - "a beautiful blue butterfly flying around flowers, closeup, 4k UHD"
+  n_prompt:
+    - "worst quality, low quality, letterboxed"
